@@ -1,0 +1,125 @@
+!pip install -q transformers accelerate datasets peft trl bitsandbytes
+!pip install -U bitsandbytes
+
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import Trainer, DataCollatorForLanguageModeling
+from peft import LoraConfig, get_peft_model
+import torch
+
+# 1️⃣ تحميل الـ Dataset
+dataset = load_dataset("json", data_files="db_questions_dataset.jsonl")
+
+# 2️⃣ تحميل Tokenizer و Model (من Qwen)
+model_name = "Qwen/Qwen2.5-7B"
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    load_in_4bit=True,  # لتقليل استهلاك VRAM
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
+
+# 3️⃣ تحويل البيانات لصيغة ChatML
+def format_chatml(example):
+    return {
+        "text": f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+                f"<|im_start|>user\n{example['instruction']}<|im_end|>\n"
+                f"<|im_start|>assistant\n{example['output']}<|im_end|>"
+    }
+
+dataset = dataset.map(format_chatml)
+dataset = dataset["train"]
+
+# 4️⃣ Tokenization
+def tokenize(examples):
+    return tokenizer(
+        examples["text"],
+        truncation=True,
+        max_length=512,
+        padding="max_length"
+    )
+
+tokenized_dataset = dataset.map(tokenize, batched=True)
+
+# 5️⃣ إعداد LoRA (من PEFT)
+lora_config = LoraConfig(
+    r=16,               # عدد الـ rank dimensions
+    lora_alpha=32,      # Scaling factor
+    target_modules=["q_proj", "v_proj"],  # الطبقات التي نطبق عليها LoRA
+    lora_dropout=0.05,  # احتمالية drop
+    bias="none",        # هل ندرّب الـ bias أم لا
+    task_type="CAUSAL_LM"  # نوع المهمة: توليد نصوص
+)
+
+model = get_peft_model(model, lora_config)
+
+# 6️⃣ إعداد الـ TrainingArguments
+training_args = TrainingArguments(
+    output_dir="./qwen_db_finetuned",  # مجلد حفظ النتائج
+    per_device_train_batch_size=2,     # حجم الباتش لكل GPU
+    gradient_accumulation_steps=4,     # دمج الجريدنتات
+    warmup_steps=50,                   # عدد خطوات التسخين
+    max_steps=200,                     # عدد خطوات التدريب (أو استخدم num_train_epochs)
+    learning_rate=2e-5,                # معدل التعلم
+    fp16=True,                         # تشغيل بـ Half Precision
+    logging_steps=10,                  # كل كام خطوة يطبع لوج
+    save_steps=100,                    # كل كام خطوة يحفظ موديل
+    save_total_limit=2,                # عدد النسخ المحفوظة
+    optim="paged_adamw_8bit",          # Optimizer من bitsandbytes
+    report_to="none"                   # تعطيل wandb
+)
+
+# 7️⃣ تجهيز الـ Data Collator
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False  # لأننا ندرّب على causal language modeling وليس Masked LM
+)
+
+# 8️⃣ إنشاء الـ Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset,
+    data_collator=data_collator
+)
+
+# 9️⃣ بدء التدريب
+trainer.train()
+
+# 🔟 حفظ الموديل بعد التدريب
+trainer.save_model("./qwen_db_finetuned")
+tokenizer.save_pretrained("./qwen_db_finetuned")
+
+print("✅ Fine-tuning completed successfully!")
+
+
+
+
+
+
+# إنشاء Prompt بنفس طريقة التدريب
+prompt = (
+    "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+    "<|im_start|>user\nWhat is normalization in databases?<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+# توليد النص
+outputs = model.generate(
+    **inputs,
+    max_new_tokens=150,
+    temperature=0.0,   # للتحكم في العشوائية (أقل = أكثر دقة)
+    top_p=0.9,         # للاختيار الاحتمالي
+    repetition_penalty=1.1,  # لتجنب التكرار
+    do_sample=True
+)
+
+# طباعة الناتج
+print("\n🧠 Model Output:\n")
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+
+
+
