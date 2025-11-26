@@ -1,0 +1,139 @@
+# ============================================================
+#  train_qwen3_8b_lora.py — Fine-tuning Qwen3-8B in 8-bit
+# ============================================================
+
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling,
+    BitsAndBytesConfig
+)
+from peft import LoraConfig, get_peft_model
+import torch
+
+# ------------------------------------------------------
+# 1️⃣ Load Dataset
+# ------------------------------------------------------
+dataset = load_dataset("json", data_files="db_questions_dataset.jsonl")
+
+# ------------------------------------------------------
+# 2️⃣ Load Tokenizer + 8-bit Quantized Model
+# ------------------------------------------------------
+model_name = "Qwen/Qwen3-8B"
+
+# BitsAndBytes 8bit config
+bnb_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,
+    llm_int8_has_fp16_weight=False
+)
+
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map="auto"
+)
+
+# ------------------------------------------------------
+# 3️⃣ Convert Data to ChatML
+# ------------------------------------------------------
+def format_chatml(example):
+    return {
+        "text": (
+            f"<|im_start|>system\nYou are a helpful SQL assistant.<|im_end|>\n"
+            f"<|im_start|>user\n{example['instruction']}<|im_end|>\n"
+            f"<|im_start|>assistant\n{example['output']}<|im_end|>"
+        )
+    }
+
+dataset = dataset.map(format_chatml)
+dataset = dataset["train"]
+
+# ------------------------------------------------------
+# 4️⃣ Tokenization
+# ------------------------------------------------------
+def tokenize(examples):
+    return tokenizer(
+        examples["text"],
+        truncation=True,
+        max_length=512,
+        padding="max_length"
+    )
+
+tokenized_dataset = dataset.map(tokenize, batched=True)
+
+# ------------------------------------------------------
+# 5️⃣ LoRA Config for 8-bit training
+# ------------------------------------------------------
+model.gradient_checkpointing_enable()
+model.enable_input_require_grads()
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    # target_modules=[
+    #     "q_proj", "v_proj", "k_proj", "o_proj",
+    #     "up_proj", "down_proj", "gate_proj"
+    # ],
+      target_modules=[
+        "q_proj", "v_proj"
+    ],
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+model = get_peft_model(model, lora_config)
+
+# ------------------------------------------------------
+# 6️⃣ TrainingArguments
+# ------------------------------------------------------
+training_args = TrainingArguments(
+    output_dir="./qwen3_8B_sql_lora",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    warmup_steps=50,
+    max_steps=130,
+    learning_rate=2e-5,
+    fp16=True,
+    logging_steps=10,
+    save_steps=100,
+    save_total_limit=2,
+    optim="paged_adamw_8bit",
+    report_to="none"
+)
+
+# ------------------------------------------------------
+# 7️⃣ Data Collator
+# ------------------------------------------------------
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False
+)
+
+# ------------------------------------------------------
+# 8️⃣ Trainer
+# ------------------------------------------------------
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset,
+    data_collator=data_collator
+)
+
+# ------------------------------------------------------
+# 9️⃣ Train
+# ------------------------------------------------------
+trainer.train()
+
+# ------------------------------------------------------
+# 🔟 Save Model
+# ------------------------------------------------------
+trainer.save_model("./qwen3_8B_sql_lora")
+tokenizer.save_pretrained("./qwen3_8B_sql_lora")
+
+print("✅ Fine-tuning completed successfully!")

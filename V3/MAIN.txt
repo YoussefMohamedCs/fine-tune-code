@@ -1,0 +1,87 @@
+# ============================================================
+#  launch_sql_guard_qwen3.py — Interactive SQL-only Chat
+# ============================================================
+
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import torch
+
+# ------------------------------------------------------
+# 1️⃣ Load Fine-tuned Model in 8-bit
+# ------------------------------------------------------
+model_path = "./qwen3_8B_sql_lora"
+
+bnb_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,
+    llm_int8_has_fp16_weight=False
+)
+
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+# model = AutoModelForCausalLM.from_pretrained(
+#     model_path,
+#     quantization_config=bnb_config,
+#     torch_dtype=torch.float16,
+#       device_map={"": 0}   # ← GPU 0
+# )
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    quantization_config=bnb_config,
+    torch_dtype=torch.float16,
+    device_map= 0  # splits model across available GPUs
+)
+
+print("Model Loaded (8-bit + LoRA Adapters)")
+
+# =====================================================================
+#  🚨 SQL-ONLY GUARD
+# =====================================================================
+
+def is_sql_question(question: str) -> bool:
+    sql_keywords = [
+        "sql", "database", "databases", "query", "queries", "table", "tables",
+        "join", "inner join", "left join", "right join", "full join",
+        "primary key", "foreign key", "schema", "index", "insert", "update",
+        "delete", "select", "where", "group by", "order by", "having",
+        "transaction", "commit", "rollback", "constraints"
+    ]
+    q = question.lower()
+    return any(word in q for word in sql_keywords)
+
+def guard_filter(user_question: str) -> bool:
+    return is_sql_question(user_question)
+
+# =====================================================================
+#  🧠 20-Turn Interactive SQL Assistant
+# =====================================================================
+for i in range(20):
+    print(f"\n🟦 Question {i+1}/20")
+    user_question = input("Enter your SQL question: ")
+
+    if not guard_filter(user_question):
+        print("❌ This model only answers SQL-related questions.")
+        continue
+
+    print("🟢 Allowed — SQL question detected!")
+
+    # Format ChatML prompt
+    prompt = (
+        "<|im_start|>system\nYou are a helpful SQL assistant.<|im_end|>\n"
+        f"<|im_start|>user\n{user_question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=350,
+        temperature=0.1,
+        top_p=0.9,
+        repetition_penalty=1.1,
+        do_sample=True
+    )
+
+    print("\n🧠 Model Output:\n")
+    print(tokenizer.decode(outputs[0], skip_special_tokens=True))
