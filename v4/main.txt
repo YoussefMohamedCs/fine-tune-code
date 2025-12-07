@@ -1,0 +1,225 @@
+# ============================================================
+# launch_sql_guard_qwen3.py — Interactive SQL-only Chat
+# Enhanced with: History, Auto Tokens, Hyperlinks
+# ============================================================
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import torch
+import re
+from datetime import datetime
+
+# ------------------------------------------------------
+# 1️⃣ Load Fine-tuned Model in 8-bit
+# ------------------------------------------------------
+model_path = "./qwen3_8B_sql_lora"
+
+bnb_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,
+    llm_int8_has_fp16_weight=False
+)
+
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    quantization_config=bnb_config,
+    torch_dtype=torch.float16,
+    device_map=0  # splits model across available GPUs
+)
+
+print("✅ Model Loaded (8-bit + LoRA Adapters)")
+print("=" * 70)
+
+# =====================================================================
+# 🚨 SQL-ONLY GUARD
+# =====================================================================
+def is_sql_question(question: str) -> bool:
+    sql_keywords = [
+        "sql", "database", "databases", "query", "queries", "table", "tables",
+        "join", "inner join", "left join", "right join", "full join",
+        "primary key", "foreign key", "schema", "index", "indexes",
+        "insert", "update", "delete", "select", "where", "group by",
+        "order by", "having", "transaction", "commit", "rollback",
+        "constraints", "aggregate", "count", "sum", "avg", "max", "min",
+        "union", "subquery", "view", "stored procedure", "trigger",
+        "normalization", "denormalization", "acid", "nosql", "relational"
+    ]
+    q = question.lower()
+    return any(word in q for word in sql_keywords)
+
+def guard_filter(user_question: str) -> bool:
+    return is_sql_question(user_question)
+
+# =====================================================================
+# 📝 History Management
+# =====================================================================
+conversation_history = []
+
+def add_to_history(question: str, answer: str):
+    """Store conversation with timestamp"""
+    conversation_history.append({
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "question": question,
+        "answer": answer
+    })
+
+def format_history_for_prompt():
+    """Format history for ChatML"""
+    formatted = ""
+    # Include last 3 conversations for context (adjustable)
+    recent_history = conversation_history[-3:] if len(conversation_history) > 3 else conversation_history
+    
+    for entry in recent_history:
+        formatted += f"<|im_start|>user\n{entry['question']}<|im_end|>\n"
+        formatted += f"<|im_start|>assistant\n{entry['answer']}<|im_end|>\n"
+    
+    return formatted
+
+def show_history():
+    """Display conversation history"""
+    if not conversation_history:
+        print("\n📋 No conversation history yet.")
+        return
+    
+    print("\n" + "=" * 70)
+    print("📋 CONVERSATION HISTORY")
+    print("=" * 70)
+    for i, entry in enumerate(conversation_history, 1):
+        print(f"\n🕐 {entry['timestamp']} | Turn {i}")
+        print(f"❓ Q: {entry['question'][:80]}{'...' if len(entry['question']) > 80 else ''}")
+        print(f"💡 A: {entry['answer'][:80]}{'...' if len(entry['answer']) > 80 else ''}")
+    print("=" * 70 + "\n")
+
+# =====================================================================
+# 🔗 Hyperlink Detection & Formatting
+# =====================================================================
+def clean_thinking_tags(text: str) -> str:
+    """Remove <think> tags and their content from model output"""
+    # Remove <think>...</think> blocks (multiline, case-insensitive)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    
+    # Remove any standalone tags
+    text = re.sub(r'</?think>', '', text, flags=re.IGNORECASE)
+    
+    # Clean up extra whitespace
+    text = re.sub(r'\n\s*\n\s*\n', '\n\n', text)
+    text = text.strip()
+    
+    return text
+    
+def add_hyperlinks(text: str) -> str:
+    """Convert URLs and SQL resources to clickable markdown links"""
+    # Detect URLs
+    url_pattern = r'(https?://[^\s]+)'
+    text = re.sub(url_pattern, r'[\1](\1)', text)
+    
+    # Add helpful SQL resource links
+    resources = {
+        "W3Schools SQL": "https://www.w3schools.com/sql/",
+        "SQLZoo": "https://sqlzoo.net/",
+        "SQL Tutorial": "https://www.sqltutorial.org/",
+        "PostgreSQL Docs": "https://www.postgresql.org/docs/",
+        "MySQL Docs": "https://dev.mysql.com/doc/"
+    }
+    
+    # Check if answer mentions specific databases
+    if "postgresql" in text.lower():
+        text += f"\n\n📚 Resource: [{resources['PostgreSQL Docs']}]"
+    elif "mysql" in text.lower():
+        text += f"\n\n📚 Resource: [{resources['MySQL Docs']}]"
+    
+    return text
+
+# =====================================================================
+# 🧠 20-Turn Interactive SQL Assistant
+# =====================================================================
+print("\n🤖 SQL Assistant Started!")
+print("Commands: 'history' to view past conversations, 'quit' to exit\n")
+
+for i in range(20):
+    print(f"\n{'='*70}")
+    print(f"🟦 Question {i+1}/20")
+    print(f"{'='*70}")
+    
+    user_question = input("Enter your SQL question (or command): ").strip()
+    
+    # Handle commands
+    if user_question.lower() == 'quit':
+        print("\n👋 Exiting SQL Assistant. Goodbye!")
+        break
+    
+    if user_question.lower() == 'history':
+        show_history()
+        continue
+    
+    if not user_question:
+        print("⚠️ Please enter a question.")
+        continue
+    
+    # Guard filter
+    if not guard_filter(user_question):
+        print("❌ This model only answers SQL-related questions.")
+        print("💡 Try asking about: databases, queries, joins, tables, etc.")
+        continue
+    
+    print("🟢 SQL question detected! Processing...\n")
+    
+    # Build prompt with history
+    history_context = format_history_for_prompt()
+    prompt = (
+        "<|im_start|>system\nYou are a helpful SQL assistant.<|im_end|>\n"
+        f"{history_context}"
+        f"<|im_start|>user\n{user_question}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    
+    # Tokenize
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    input_length = inputs.input_ids.shape[1]
+    
+    # Calculate max_new_tokens dynamically (model max - input - buffer)
+    model_max_length = tokenizer.model_max_length if tokenizer.model_max_length < 1e6 else 4096
+    max_new_tokens = model_max_length - input_length - 50  # 50 token buffer
+    max_new_tokens = max(256, min(max_new_tokens, 2048))  # Between 256-2048
+    
+    # Generate response
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=0.1,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id
+        )
+    
+    # Decode output
+    full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
+    # Extract only the assistant's response (remove prompt)
+    if "<|im_start|>assistant" in full_response:
+        answer = full_response.split("<|im_start|>assistant")[-1].strip()
+    else:
+        answer = full_response[len(tokenizer.decode(inputs.input_ids[0], skip_special_tokens=True)):].strip()
+    
+    # Add hyperlinks
+    answer = add_hyperlinks(answer)
+    
+    # Add to history
+    add_to_history(user_question, answer)
+    
+    # Display formatted output
+    print("=" * 70)
+    print("🧠 MODEL OUTPUT:")
+    print("=" * 70)
+    answer = clean_thinking_tags(answer)
+    print(answer)
+    print("=" * 70)
+    print(f"📊 Generated {len(outputs[0]) - input_length} tokens")
+    print("=" * 70)
+
+
+print("=" * 70)
+show_history()
