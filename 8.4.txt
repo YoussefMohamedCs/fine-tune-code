@@ -1,7 +1,7 @@
 # ============================================================
-# launch_sql_lora_8BIT_OPTIMIZED.py — RTX 4080 Super
+# launch_sql_lora_FP16_MAXIMUM_SPEED.py — RTX 4080 Super
 # ============================================================
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel, PeftConfig
 import torch
 import re
@@ -22,10 +22,13 @@ torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision('high')
 
+# Clear cache
+torch.cuda.empty_cache()
+
 print("=" * 70)
 
 # ------------------------------------------------------
-# 1️⃣ Load LoRA Model with 8-bit Quantization
+# 1️⃣ Load Model in PURE FP16 (NO QUANTIZATION)
 # ------------------------------------------------------
 lora_model_path = "./qwen3_8B_sql_lora"
 
@@ -40,13 +43,6 @@ except:
     is_lora = False
     print("✅ Detected full model (not LoRA)")
 
-# 8-bit quantization config (faster than 4-bit on RTX 4080 Super)
-bnb_config = BitsAndBytesConfig(
-    load_in_8bit=True,
-    llm_int8_threshold=6.0,
-    llm_int8_has_fp16_weight=False
-)
-
 print("\n⏳ Loading tokenizer...")
 if is_lora:
     tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
@@ -57,29 +53,41 @@ tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "left"
 
 if is_lora:
-    print("⏳ Loading base model in 8-bit...")
+    print("⏳ Loading base model in FP16 (NO quantization)...")
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
-        quantization_config=bnb_config,
+        torch_dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.float16
+        low_cpu_mem_usage=True
     )
     
     print("⏳ Loading and merging LoRA adapter...")
-    model = PeftModel.from_pretrained(base_model, lora_model_path, torch_dtype=torch.float16)
-    model = model.merge_and_unload()  # 🚀 Merge for speed
-else:
-    print("⏳ Loading model in 8-bit...")
-    model = AutoModelForCausalLM.from_pretrained(
-        lora_model_path,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=True,
+    model = PeftModel.from_pretrained(
+        base_model, 
+        lora_model_path, 
         torch_dtype=torch.float16
     )
+    print("⏳ Merging LoRA weights into base model...")
+    model = model.merge_and_unload()
+else:
+    print("⏳ Loading model in FP16 (NO quantization)...")
+    model = AutoModelForCausalLM.from_pretrained(
+        lora_model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+        low_cpu_mem_usage=True
+    )
 
+# Move to GPU and set to eval
+model = model.to(device)
 model.eval()
+
+# Check VRAM usage
+print(f"📊 VRAM allocated: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+print(f"📊 VRAM reserved: {torch.cuda.memory_reserved()/1024**3:.2f} GB")
+
 print("✅ Model Ready!")
 print("=" * 70)
 
@@ -114,15 +122,22 @@ def format_history():
 THINKING_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
 
 # ------------------------------------------------------
-# 4️⃣ Warmup
+# 4️⃣ Warmup (CRITICAL for speed)
 # ------------------------------------------------------
-print("\n🔥 Running warmup...")
+print("\n🔥 Running warmup (3 iterations for GPU optimization)...")
 warmup_prompt = "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
 warmup_inputs = tokenizer(warmup_prompt, return_tensors="pt").to(device)
 
-with torch.inference_mode():
-    _ = model.generate(**warmup_inputs, max_new_tokens=20, do_sample=False)
+for _ in range(3):
+    with torch.inference_mode():
+        _ = model.generate(
+            **warmup_inputs, 
+            max_new_tokens=50,
+            do_sample=False,
+            use_cache=True
+        )
 
+torch.cuda.synchronize()
 print("✅ Warmup complete!")
 print("=" * 70)
 
@@ -155,26 +170,34 @@ for i in range(20):
     
     print("🟢 Processing...\n")
     
-    # Build prompt
+    # Build prompt (keep it shorter for speed)
     prompt = f"{SYSTEM}{format_history()}<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
     
     # Tokenize
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536).to(device)
+    inputs = tokenizer(
+        prompt, 
+        return_tensors="pt", 
+        truncation=True, 
+        max_length=1024  # Reduced from 1536 for speed
+    ).to(device)
     input_len = inputs.input_ids.shape[1]
     
-    # Generation (optimized for 8-bit)
+    # Generation (maximum speed settings)
     torch.cuda.synchronize()
     start = datetime.now()
     
-    with torch.inference_mode():
+    with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.float16):
         output = model.generate(
             **inputs,
-            max_new_tokens=2048,
-            do_sample=False,  # Greedy = fastest
+            max_new_tokens=512,  # Reduced from 2048 for faster initial response
+            do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             use_cache=True,
-            num_beams=1  # Explicit beam=1 for greedy
+            num_beams=1,
+            temperature=None,
+            top_p=None,
+            top_k=None
         )
     
     torch.cuda.synchronize()
@@ -207,6 +230,7 @@ for i in range(20):
     print(answer)
     print("=" * 70)
     print(f"⚡ {tokens} tokens | {elapsed:.2f}s | {speed:.1f} tok/s")
+    print(f"📊 VRAM used: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
     print("=" * 70)
 
 print("\n✅ Session complete!")
