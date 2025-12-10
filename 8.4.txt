@@ -1,0 +1,212 @@
+# ============================================================
+# launch_sql_lora_8BIT_OPTIMIZED.py — RTX 4080 Super
+# ============================================================
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import PeftModel, PeftConfig
+import torch
+import re
+from datetime import datetime
+
+# ------------------------------------------------------
+# 0️⃣ GPU Setup
+# ------------------------------------------------------
+if not torch.cuda.is_available():
+    raise SystemError("❌ No CUDA GPU detected.")
+
+device = torch.device("cuda")
+print(f"⚡ GPU: {torch.cuda.get_device_name(0)}")
+
+# Maximum performance
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision('high')
+
+print("=" * 70)
+
+# ------------------------------------------------------
+# 1️⃣ Load LoRA Model with 8-bit Quantization
+# ------------------------------------------------------
+lora_model_path = "./qwen3_8B_sql_lora"
+
+# Detect LoRA
+try:
+    peft_config = PeftConfig.from_pretrained(lora_model_path)
+    is_lora = True
+    base_model_name = peft_config.base_model_name_or_path
+    print(f"✅ Detected LoRA adapter!")
+    print(f"📦 Base model: {base_model_name}")
+except:
+    is_lora = False
+    print("✅ Detected full model (not LoRA)")
+
+# 8-bit quantization config (faster than 4-bit on RTX 4080 Super)
+bnb_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,
+    llm_int8_has_fp16_weight=False
+)
+
+print("\n⏳ Loading tokenizer...")
+if is_lora:
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+else:
+    tokenizer = AutoTokenizer.from_pretrained(lora_model_path, trust_remote_code=True)
+
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "left"
+
+if is_lora:
+    print("⏳ Loading base model in 8-bit...")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16
+    )
+    
+    print("⏳ Loading and merging LoRA adapter...")
+    model = PeftModel.from_pretrained(base_model, lora_model_path, torch_dtype=torch.float16)
+    model = model.merge_and_unload()  # 🚀 Merge for speed
+else:
+    print("⏳ Loading model in 8-bit...")
+    model = AutoModelForCausalLM.from_pretrained(
+        lora_model_path,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16
+    )
+
+model.eval()
+print("✅ Model Ready!")
+print("=" * 70)
+
+# ------------------------------------------------------
+# 2️⃣ SQL Guard
+# ------------------------------------------------------
+SQL_KEYWORDS = frozenset([
+    "sql", "database", "query", "table", "join", "select", "where",
+    "insert", "update", "delete", "index", "primary key", "foreign key",
+    "schema", "constraint", "transaction", "view", "trigger", "stored procedure"
+])
+
+def guard_filter(q: str) -> bool:
+    return any(kw in q.lower() for kw in SQL_KEYWORDS)
+
+# ------------------------------------------------------
+# 3️⃣ History Management
+# ------------------------------------------------------
+history = []
+
+def add_history(q, a):
+    history.append({"q": q, "a": a})
+    if len(history) > 2:
+        history.pop(0)
+
+def format_history():
+    return "".join([
+        f"<|im_start|>user\n{h['q']}<|im_end|>\n<|im_start|>assistant\n{h['a']}<|im_end|>\n"
+        for h in history
+    ])
+
+THINKING_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
+
+# ------------------------------------------------------
+# 4️⃣ Warmup
+# ------------------------------------------------------
+print("\n🔥 Running warmup...")
+warmup_prompt = "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+warmup_inputs = tokenizer(warmup_prompt, return_tensors="pt").to(device)
+
+with torch.inference_mode():
+    _ = model.generate(**warmup_inputs, max_new_tokens=20, do_sample=False)
+
+print("✅ Warmup complete!")
+print("=" * 70)
+
+# ------------------------------------------------------
+# 5️⃣ Ultra-Fast SQL Assistant Loop
+# ------------------------------------------------------
+print("\n🤖 SQL Assistant Ready! Commands: 'history', 'quit'\n")
+
+SYSTEM = "<|im_start|>system\nYou are a helpful SQL expert. Be concise.<|im_end|>\n"
+
+for i in range(20):
+    print(f"\n{'='*70}")
+    print(f"🟦 Question {i+1}/20")
+    print(f"{'='*70}")
+    
+    question = input("SQL question: ").strip()
+    
+    if question.lower() == "quit":
+        print("\n👋 Goodbye!")
+        break
+    
+    if question.lower() == "history":
+        for h in history:
+            print(f"\nQ: {h['q']}\nA: {h['a']}")
+        continue
+    
+    if not guard_filter(question):
+        print("❌ Please ask about SQL topics.")
+        continue
+    
+    print("🟢 Processing...\n")
+    
+    # Build prompt
+    prompt = f"{SYSTEM}{format_history()}<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
+    
+    # Tokenize
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1536).to(device)
+    input_len = inputs.input_ids.shape[1]
+    
+    # Generation (optimized for 8-bit)
+    torch.cuda.synchronize()
+    start = datetime.now()
+    
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=2048,
+            do_sample=False,  # Greedy = fastest
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            num_beams=1  # Explicit beam=1 for greedy
+        )
+    
+    torch.cuda.synchronize()
+    elapsed = (datetime.now() - start).total_seconds()
+    
+    # Decode
+    full_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    
+    if "<|im_start|>assistant" in full_text:
+        answer = full_text.split("<|im_start|>assistant")[-1].strip()
+    else:
+        answer = full_text[len(prompt):].strip()
+    
+    answer = THINKING_RE.sub('', answer).strip()
+    
+    add_history(question, answer)
+    
+    tokens = len(output[0]) - input_len
+    speed = tokens / elapsed if elapsed > 0 else 0
+    
+    print("=" * 70)
+    print("🧠 ANSWER:")
+    print("=" * 70)
+    
+    # Clean output
+    if "</think>" in answer:
+        index = answer.find("</think>")
+        answer = answer[index+8:]
+    
+    print(answer)
+    print("=" * 70)
+    print(f"⚡ {tokens} tokens | {elapsed:.2f}s | {speed:.1f} tok/s")
+    print("=" * 70)
+
+print("\n✅ Session complete!")
