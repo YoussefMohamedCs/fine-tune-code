@@ -1,0 +1,237 @@
+# ============================================================
+# main_llama3.py — Llama-3 8B LoRA Inference
+# ✅ Fixed: StoppingCriteria بدل eos_token_id
+# ✅ Fixed: يوقف عند **Note:** (147/150 إجابة بتنتهي بيه)
+# ✅ Fixed: max_new_tokens=1500
+# ============================================================
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+    StoppingCriteria, StoppingCriteriaList
+)
+from peft import PeftModel, PeftConfig
+import torch, gc
+from datetime import datetime
+
+if not torch.cuda.is_available():
+    raise SystemError("❌ No CUDA GPU detected.")
+device = torch.device("cuda")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+torch.cuda.empty_cache()
+gc.collect()
+
+# ─────────────────────────────────────────────────────────────
+# 1️⃣  Load model
+# ─────────────────────────────────────────────────────────────
+lora_model_path = "./llama3_8B_lora_v3"
+
+try:
+    peft_config     = PeftConfig.from_pretrained(lora_model_path)
+    base_model_name = peft_config.base_model_name_or_path
+    is_lora         = True
+except Exception:
+    is_lora         = False
+    base_model_name = lora_model_path
+
+bnb_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,
+    llm_int8_has_fp16_weight=False,
+    llm_int8_enable_fp32_cpu_offload=True,
+)
+
+tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+tokenizer.pad_token = tokenizer.eos_token
+
+print("⏳ Loading model in 8-bit …")
+model = AutoModelForCausalLM.from_pretrained(
+    base_model_name,
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True,
+    low_cpu_mem_usage=True,
+)
+if is_lora:
+    print("⏳ Applying LoRA adapters …")
+    model = PeftModel.from_pretrained(model, lora_model_path)
+
+model.eval()
+torch.cuda.empty_cache()
+gc.collect()
+print(f"✅ Model loaded | VRAM used: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+
+# ─────────────────────────────────────────────────────────────
+# 2️⃣  Stopping Criteria
+# ─────────────────────────────────────────────────────────────
+STOP_TOKEN_IDS = [128009, 128001]  # <|eot_id|>, <|end_of_text|>
+
+class StopOnTokens(StoppingCriteria):
+    def __init__(self, stop_ids: list):
+        self.stop_ids = stop_ids
+
+    def __call__(self, input_ids: torch.LongTensor, scores, **kwargs) -> bool:
+        return input_ids[0, -1].item() in self.stop_ids
+
+# ─────────────────────────────────────────────────────────────
+# 3️⃣  System prompt
+# ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = (
+    "You are an ER modeling expert. No thinking tags. No prose. "
+    "Always give exactly TWO solutions with entity types and relationships only: "
+    "Solution 1: Direct modeling (if repetition is not needed) - use M:M relationship directly. "
+    "Solution 2: MANDATORY Transaction entity (if repetition is needed) - ALWAYS resolve every M:M "
+    "using a Transaction entity. Never skip Solution 2. Do not repeat the answer.\n\n"
+
+    "=== EXAMPLE 1 ===\n"
+    "Question: A database is decided for a large construction enterprise to support its resources "
+    "management. Such an enterprise has a set of Departments and Projects. Each department has a set "
+    "of Equipment. Equipment's are assigned to projects for a specific period of time...\n\n"
+    "Answer:\n"
+    "## Solution 1: Using M:M Relationship (Direct Assignment)\n"
+    "### Entity Types\n"
+    "#### Department: Department_Number (PK), Name (Unique), Budget\n"
+    "#### Equipment: Equipment_Number (PK), Name, Location\n"
+    "#### Project: Project_Number (PK), Name, Location\n"
+    "### Relationships\n"
+    "#### Owns: Department → Equipment | 1:M\n"
+    "#### Assigned_To: Equipment ↔ Project | M:M | Attributes: Assignment_Start_Date, Assignment_Finish_Date\n\n"
+    "## Solution 2: Resolving M:M Using Transaction Entity\n"
+    "### Entity Types\n"
+    "#### Department: Department_Number (PK), Name (Unique), Budget\n"
+    "#### Equipment: Equipment_Number (PK), Name, Location, Department_Number (FK)\n"
+    "#### Project: Project_Number (PK), Name, Location\n"
+    "#### Transaction: Transaction_Number (PK), Assignment_Start_Date, Assignment_Finish_Date, "
+    "Equipment_Number (FK), Project_Number (FK)\n"
+    "### Relationships\n"
+    "#### Owns: Department → Equipment | 1:M\n"
+    "#### Equipment_Assignment: Equipment → Transaction | 1:M\n"
+    "#### Project_Assignment: Project → Transaction | 1:M\n\n"
+
+    "=== EXAMPLE 2 ===\n"
+    "Question: A database contains information concerning sales representatives, sales areas, "
+    "and products. Each representative is responsible for sales in more than one area...\n\n"
+    "Answer:\n"
+    "## Solution 1: Using M:M Relationship (Direct Modeling)\n"
+    "### Entity Types\n"
+    "#### Sales_Representative: Representative_Number (PK), Representative_Name (Unique), Sales_Commission\n"
+    "#### Sales_Area: Area_Number (PK), Location, Commission_Rate\n"
+    "#### Product: Product_Number (PK), Product_Name, Price\n"
+    "### Relationships\n"
+    "#### Sells: Sales_Representative ↔ Product ↔ Sales_Area | M:M:M | Attribute: Quantity_Sold\n\n"
+    "## Solution 2: Resolving M:M Using Transaction Entity\n"
+    "### Entity Types\n"
+    "#### Sales_Representative: Representative_Number (PK), Representative_Name (Unique), "
+    "Sales_Commission, Area_Number (FK)\n"
+    "#### Sales_Area: Area_Number (PK), Location, Commission_Rate\n"
+    "#### Product: Product_Number (PK), Product_Name, Price\n"
+    "#### Transaction: Transaction_Number (PK), Sub_Quantity_Sold, Representative_Number (FK), "
+    "Product_Number (FK), SalesArea_Number (FK)\n"
+    "### Relationships\n"
+    "#### Sales_Area_Transaction: Sales_Area → Transaction | 1:M\n"
+    "#### Representative_Transaction: Sales_Representative → Transaction | 1:M\n"
+    "#### Product_Transaction: Product → Transaction | 1:M\n\n"
+
+    "=== NOW ANSWER THE FOLLOWING ==="
+)
+
+def build_prompt(question: str) -> str:
+    return (
+        f"<|begin_of_text|>"
+        f"<|start_header_id|>system<|end_header_id|>\n{SYSTEM_PROMPT}<|eot_id|>"
+        f"<|start_header_id|>user<|end_header_id|>\n{question}<|eot_id|>"
+        f"<|start_header_id|>assistant<|end_header_id|>\n"
+    )
+
+# ─────────────────────────────────────────────────────────────
+# 4️⃣  Extract answer
+# ✅ يوقف عند **Note:** لأن 147/150 إجابة بتنتهي بيه
+# كل حاجة بعده = تكرار أو كلام غريب
+# ─────────────────────────────────────────────────────────────
+DEBUG = False
+
+def extract_answer(new_token_ids) -> str:
+    raw = tokenizer.decode(new_token_ids, skip_special_tokens=False)
+
+    if DEBUG:
+        print("\n" + "="*60)
+        print("🔍 RAW OUTPUT:")
+        print(raw[:4000])
+        print("="*60 + "\n")
+
+    # شيل special tokens أولاً
+    for stop in ["<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"]:
+        if stop in raw:
+            raw = raw[: raw.index(stop)]
+
+    # ✅ وقف عند الـ Note الأخيرة بس (مش أي Note)
+    # الـ Note الأخيرة = "Check if repetition is needed or not"
+    # الـ Notes الجوه الإجابة = "If repetition is not needed" -- متوقفش عندها
+    final_note = "**answer end**"
+    if final_note in raw:
+        idx = raw.index(final_note)
+        end = raw.find('\n', idx + len(final_note))
+        raw = raw[: end if end != -1 else idx + len(final_note) + 80]
+
+    return raw.strip()
+
+# ─────────────────────────────────────────────────────────────
+# 5️⃣  Main loop
+# ─────────────────────────────────────────────────────────────
+for i in range(20):
+    print(f"\n🟦 Question {i+1}/20")
+    question = input("ER Modeling question: ").strip()
+
+    if question.lower() == "quit":
+        break
+
+    prompt       = build_prompt(question)
+    inputs       = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+    input_length = inputs["input_ids"].shape[1]
+
+    print(f"📏 Prompt tokens: {input_length}")
+
+    stopping_criteria = StoppingCriteriaList([StopOnTokens(STOP_TOKEN_IDS)])
+
+    torch.cuda.empty_cache()
+
+    start = datetime.now()
+    with torch.inference_mode():
+        # output = model.generate(
+        #     **inputs,
+        #     max_new_tokens     = 1500,
+        #     do_sample          = False,
+        #     pad_token_id       = tokenizer.eos_token_id,
+        #     repetition_penalty = 1.05,
+        #     use_cache          = True,
+        #     temperature=0.1 ,
+        #     stopping_criteria  = stopping_criteria,
+        # )
+
+        output = model.generate(
+    **inputs,
+    max_new_tokens     = 1500,
+    do_sample          = True,       # ✅
+    temperature        = 0.1,        # ✅ دلوقتي بتشتغل
+    top_p              = 0.9,        # ✅ جديد
+    pad_token_id       = tokenizer.eos_token_id,
+    repetition_penalty = 1.2,        # ✅ أقوى
+    use_cache          = True,
+    stopping_criteria  = stopping_criteria,
+)
+        
+    elapsed = (datetime.now() - start).total_seconds()
+
+    new_tokens = output[0][input_length:]
+    answer     = extract_answer(new_tokens.tolist())
+
+    del output, inputs
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    print(f"\n🧠 ANSWER:\n{'─'*40}\n{answer}\n{'─'*40}")
+    print(f"⚡ {len(new_tokens)/elapsed:.1f} tok/s | VRAM: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+
+print("\n✅ Session complete!")
