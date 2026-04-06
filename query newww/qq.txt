@@ -1,0 +1,133 @@
+!pip install transformers torch accelerate
+
+
+
+
+
+
+
+
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+import torch
+
+# ضع الـ API Key بتاعك هنا (علشان تنزل Llama محتاج تكون accepted)
+HF_TOKEN = ""
+
+MODEL_ID = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+SYSTEM_PROMPT = """You are a helpful SQL query assistant for database students and developers.
+
+You specialize in:
+- Writing SQL queries (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, ALTER, etc.)
+- Fixing and debugging SQL errors
+- Explaining SQL concepts (JOINs, subqueries, indexes, normalization, transactions, etc.)
+- Optimizing queries for performance
+- Converting database scenarios into full SQL schemas (CREATE TABLE with PKs, FKs, constraints)
+- Converting ER diagrams and entity-relationship designs into relational SQL DDL
+- Handling M:M relationships, transaction/bridge entities, and cardinality rules
+
+When a user greets you or asks if you can help, respond warmly and explain what you can do.
+
+When a user describes a real-world scenario (e.g., a company managing departments and projects), you should:
+1. Identify entity types and relationships
+2. Produce proper CREATE TABLE statements with correct data types, PKs, FKs, and constraints
+3. Offer sample queries if helpful
+
+When a user pastes ER entities and relationships directly, produce the corresponding SQL schema immediately.
+
+Always format SQL in code blocks.
+
+If a user asks something completely unrelated to SQL or databases, politely say:
+"I'm specialized in SQL and databases — feel free to ask me anything related to queries, schemas, or database design!"
+"""
+
+# ══════════════════════════════════════════
+#  تحميل الموديل (هينزل أول مرة بس)
+# ══════════════════════════════════════════
+print("⏳ جاري تحميل الموديل... (أول مرة بياخد وقت)")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_ID,
+    token=HF_TOKEN,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID,
+    token=HF_TOKEN,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",        # يوزع على GPU لو موجود، CPU لو لأ
+)
+
+pipe = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+)
+
+print("✅ الموديل جاهز!\n")
+
+# تاريخ المحادثة
+conversation_history = []
+
+
+def chat(user_message):
+    # أضف رسالة المستخدم للـ history
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+
+    # ابني الـ messages بالـ system prompt + كل الـ history
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + conversation_history
+
+    # شغّل الموديل
+    output = pipe(
+        messages,
+        max_new_tokens=2048,
+        temperature=0.3,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+
+    # استخرج الرد
+    assistant_message = output[0]["generated_text"][-1]["content"]
+
+    # أضف رد الموديل للـ history
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+
+    return assistant_message
+
+
+
+print("=" * 55)
+print("   SQL Query Assistant — Llama 3.1 8B (Local)")
+print("   اكتب 'exit' أو 'quit' للخروج")
+print("   اكتب 'clear' لمسح الـ history")
+print("=" * 55)
+
+while True:
+    user_input = input("\nأنت: ").strip()
+
+    if not user_input:
+        continue
+
+    if user_input.lower() in ["exit", "quit"]:
+        print("وداعاً!")
+        break
+
+    if user_input.lower() == "clear":
+        conversation_history.clear()
+        print("✅ تم مسح الـ history")
+        continue
+
+    try:
+        print("\nالموديل: ", end="", flush=True)
+        response = chat(user_input)
+        print(response)
+        print(f"\n[History: {len(conversation_history) // 2} رسالة محفوظة]")
+
+    except Exception as e:
+        print(f"\n❌ خطأ: {e}")
